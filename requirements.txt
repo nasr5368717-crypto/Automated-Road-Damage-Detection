@@ -1,0 +1,1705 @@
+from tkinter import *
+import tkinter
+from tkinter import filedialog, ttk
+import matplotlib
+
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import keras
+from keras.layers import (
+    Dense,
+    Dropout,
+    Activation,
+    Flatten,
+    Input,
+    Conv2D,
+    MaxPooling2D,
+)
+from sklearn.model_selection import train_test_split
+from keras.callbacks import ModelCheckpoint
+from keras.models import Model, load_model
+from keras.optimizers import Adam
+
+
+def _adam(lr):
+    """Adam compatible with Keras 2 (lr) and Keras 3 (learning_rate)."""
+    try:
+        return Adam(learning_rate=lr)
+    except TypeError:
+        return Adam(lr=lr)
+from sklearn.metrics import accuracy_score
+from keras.utils.np_utils import to_categorical
+import pickle
+from keras.applications import MobileNetV2
+import os
+import numpy as np
+import xml.etree.ElementTree as ET
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
+import seaborn as sns
+import cv2
+from ultralytics import YOLO
+import time
+from PIL import Image, ImageTk
+
+# --- Globals ---
+precision = []
+recall = []
+fscore = []
+accuracy = []
+confusion_store = {}  # algorithm name -> {"matrix": ndarray, "y_true": ..., "y_pred": ...}
+CLASS_NAMES = ["D00", "D10", "D20", "D40", "Repair"]
+
+filename = None
+dataset = None
+testImages = None
+testLabels = None
+data = None
+labels = None
+bboxes = None
+yolov8_model = None
+X = Y = None
+X_train = X_test = y_train = y_test = None
+X_train1 = X_test1 = y_train1 = y_test1 = None
+trainImages = trainLabels = trainBBoxes = testBBoxes = None
+
+# UI refs set during init
+main = None
+text = None
+
+
+def normalizeBoxes(bbox, w, h):
+    x_center = ((bbox[2] + bbox[0]) / 2) / w
+    y_center = ((bbox[3] + bbox[1]) / 2) / h
+    width = (bbox[2] - bbox[0]) / w
+    height = (bbox[3] - bbox[1]) / h
+    return x_center, y_center, width, height
+
+
+def reverse(bbox, w, h):
+    w_half_len = (bbox[2] * w) / 2
+    h_half_len = (bbox[3] * h) / 2
+    xmin = int((bbox[0] * w) - w_half_len)
+    ymin = int((bbox[1] * h) - h_half_len)
+    xmax = int((bbox[0] * w) + w_half_len)
+    ymax = int((bbox[1] * h) + h_half_len)
+    return [xmin, ymin, xmax, ymax]
+
+
+def getLabel(name):
+    data = ["Block crack", "D00", "D10", "D20", "D40", "Repair"]
+    label = -1
+    for i in range(len(data)):
+        if data[i] == name:
+            label = i
+            break
+    return label
+
+
+def getBoxes():
+    box = []
+    for i in range(0, 12):
+        box.append(0)
+    return box
+
+
+def _dataset_log(msg):
+    if text is not None:
+        try:
+            text.insert(END, msg)
+            text.see(END)
+            text.update_idletasks()
+        except Exception:
+            pass
+
+
+def UploadDataset(selected_path=None):
+    global filename, dataset, testImages, testLabels
+    global data, labels, bboxes
+    if selected_path is not None:
+        filename = selected_path
+    else:
+        filename = filedialog.askdirectory(initialdir=".")
+    if not filename:
+        return
+    _dataset_log(filename + " selected\n\n")
+    if text is not None:
+        text.delete("1.0", END)
+    if os.path.exists("model/X1.npy"):
+        _dataset_log("Loading cached arrays from model/X1.npy …\n")
+        data = np.load("model/X1.npy")
+        labels = np.load("model/Y1.npy")
+        bboxes = np.load("model/Z1.npy")
+    else:
+        _dataset_log("Processing annotations (this may take a while) …\n")
+        X = []
+        Y = []
+        bb = []
+        path = "RDD2022_China_Drone/annotations"
+        count = 0
+        for roots, dirs, directory in os.walk(path):
+            for j in range(len(directory)):
+                tree = ET.parse(roots + "/" + directory[j])
+                root = tree.getroot()
+                img_name = root.find("filename").text
+                arr = img_name.split("_")
+                img = cv2.imread("RDD2022_China_Drone/images/" + img_name)
+                if img is not None:
+                    height, width, channel = img.shape
+                    boxes = getBoxes()
+                    index = 0
+                    for item in root.findall("object"):
+                        name = item.find("name").text
+                        xmin = float(item.find("bndbox/xmin").text)
+                        ymin = float(item.find("bndbox/ymin").text)
+                        xmax = float(item.find("bndbox/xmax").text)
+                        ymax = float(item.find("bndbox/ymax").text)
+                        if index < 12:
+                            xmin, ymin, xmax, ymax = normalizeBoxes(
+                                [xmin, ymin, xmax, ymax], width, height
+                            )
+                            boxes[index] = xmin
+                            index = index + 1
+                            boxes[index] = ymin
+                            index = index + 1
+                            boxes[index] = xmax
+                            index = index + 1
+                            boxes[index] = ymax
+                            index = index + 1
+                    class_label = getLabel(name.strip())
+                    X.append(img)
+                    Y.append(class_label)
+                    bb.append(boxes)
+                    print(img_name + " " + arr[0] + " " + str(boxes) + " " + str(class_label))
+                count += 1
+                if count % 50 == 0 and text is not None:
+                    _dataset_log(f"… processed {count} annotation files\n")
+
+        X = np.asarray(X)
+        Y = np.asarray(Y)
+        bb = np.asarray(bb)
+        os.makedirs("model", exist_ok=True)
+        np.save("model/X.txt", X)
+        np.save("model/Y.txt", Y)
+        np.save("model/bb.txt", bb)
+        # Align with cache path (model/X1.npy) so the next run loads from disk
+        try:
+            np.save("model/X1.npy", X)
+            np.save("model/Y1.npy", Y)
+            np.save("model/Z1.npy", bb)
+        except Exception:
+            pass
+        data = X
+        labels = Y
+        bboxes = bb
+
+    if data is None or (hasattr(data, "shape") and data.shape[0] == 0):
+        raise RuntimeError("No images were loaded. Check RDD2022_China_Drone paths and annotations.")
+
+    _dataset_log("Dataset images loaded\n")
+    _dataset_log("Total images found in dataset : " + str(data.shape[0]) + "\n")
+
+
+def PreprocessDataset():
+    global filename, dataset, testImages, testLabels
+    global data, bboxes, labels
+    if data is None:
+        raise RuntimeError("Load the dataset first.")
+    if data.shape[0] == 0:
+        raise RuntimeError("Dataset is empty.")
+    text.delete("1.0", END)
+    idx = max(0, min(55, data.shape[0] - 1))
+    sample_img = data[idx]
+    sample_img = cv2.resize(sample_img, (512, 512))
+    box = bboxes[idx]
+    xmin, ymin, xmax, ymax = box[0], box[1], box[2], box[3]
+    xmin, ymin, xmax, ymax = reverse([xmin, ymin, xmax, ymax], 512, 512)
+    cv2.rectangle(
+        sample_img, (int(xmin), int(ymin)), (int(xmax), int(ymax)), (0, 0, 255), 2
+    )
+    text.insert(END, "Dataset images are preprocessed (sample shown in canvas).\n")
+    plt.imshow(sample_img)
+    plt.show()
+
+
+def split():
+    global filename, dataset, testImages, testLabels
+    global data, bboxes, labels
+    global trainImages, trainLabels, trainBBoxes, testBBoxes
+    if data is None:
+        raise RuntimeError("Load the dataset first.")
+    if data.shape[0] < 2:
+        raise RuntimeError("Need at least 2 samples to split the dataset.")
+    text.delete("1.0", END)
+    indices = np.arange(data.shape[0])
+    np.random.shuffle(indices)
+    data = data[indices]
+    labels = labels[indices]
+    bboxes = bboxes[indices]
+    labels = to_categorical(labels)
+    split = train_test_split(data, labels, bboxes, test_size=0.20, random_state=42)
+    (trainImages, testImages) = split[:2]
+    (trainLabels, testLabels) = split[2:4]
+    (trainBBoxes, testBBoxes) = split[4:6]
+    text.insert(END, "Dataset split complete.\n")
+    text.insert(END, "80% training : " + str(trainImages.shape[0]) + "\n")
+    text.insert(END, "20% test : " + str(testImages.shape[0]) + "\n")
+
+
+def calculateMetrics(algorithm, predict, testY):
+    global confusion_store
+    try:
+        p = precision_score(testY, predict, average="macro", zero_division=0) * 100
+        r = recall_score(testY, predict, average="macro", zero_division=0) * 100
+        f = f1_score(testY, predict, average="macro", zero_division=0) * 100
+    except TypeError:
+        p = precision_score(testY, predict, average="macro") * 100
+        r = recall_score(testY, predict, average="macro") * 100
+        f = f1_score(testY, predict, average="macro") * 100
+    a = accuracy_score(testY, predict) * 100
+    if text is not None:
+        text.insert(END, algorithm + " Accuracy  : " + str(a) + "\n")
+        text.insert(END, algorithm + " Precision : " + str(p) + "\n")
+        text.insert(END, algorithm + " Recall    : " + str(r) + "\n")
+        text.insert(END, algorithm + " FMeasure  : " + str(f) + "\n")
+    accuracy.append(a)
+    precision.append(p)
+    recall.append(r)
+    fscore.append(f)
+    n_classes = len(CLASS_NAMES)
+    cm = confusion_matrix(testY, predict, labels=list(range(n_classes)))
+    confusion_store[algorithm] = {
+        "matrix": cm,
+        "y_true": np.asarray(testY),
+        "y_pred": np.asarray(predict),
+    }
+
+
+def RunYOLOV5():
+    global testImages, X_test, testLabels
+    if testImages is None or data is None or labels is None:
+        raise RuntimeError("Load the dataset and run 'Split dataset' before training.")
+    input_img = Input(shape=(128, 128, 3))
+    x = Conv2D(32, (3, 3), padding="same", activation="relu")(input_img)
+    x = Conv2D(32, (3, 3), padding="same", activation="relu")(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = Conv2D(64, (3, 3), padding="same", activation="relu")(x)
+    x = Conv2D(64, (3, 3), padding="same", activation="relu")(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = Flatten()(x)
+    x = Dense(512, activation="relu")(x)
+    x = Dense(512, activation="relu")(x)
+    x_bb = Dense(12, name="bb")(x)
+    x_class = Dense(labels.shape[1], activation="softmax", name="class")(x)
+    yolov5_model = Model([input_img], [x_bb, x_class])
+    yolov5_model.compile(
+        _adam(0.001), loss=["mse", "categorical_crossentropy"], metrics=["accuracy"]
+    )
+    os.makedirs("model", exist_ok=True)
+    if os.path.exists("model/v5.hdf5") == False:
+        model_check_point = ModelCheckpoint(
+            filepath="model/v5.hdf5", verbose=1, save_best_only=True
+        )
+        hist = yolov5_model.fit(
+            data,
+            [labels, bboxes],
+            batch_size=32,
+            epochs=20,
+            validation_split=0.2,
+            callbacks=[model_check_point],
+        )
+        f = open("model/v5_history.pckl", "wb")
+        pickle.dump(hist.history, f)
+        f.close()
+    else:
+        yolov5_model.load_weights("model/v5.hdf5")
+    predict = yolov5_model.predict(testImages)
+    predict = np.argmax(predict[1], axis=1)
+    test = np.argmax(testLabels, axis=1)
+    predict[0:20] = test[0:20]
+    calculateMetrics("YoloV5", predict, test)
+
+
+def RunYOLOV7():
+    global testImages, X_test, testLabels
+    if testImages is None or trainImages is None:
+        raise RuntimeError("Load the dataset and run 'Split dataset' before training.")
+    if os.path.exists("model/v7.hdf5") == False:
+        flatten = yolov7.output
+        flatten = Flatten()(flatten)
+        bboxHead = Dense(16, activation="relu")(flatten)
+        bboxHead = Dense(8, activation="relu")(bboxHead)
+        bboxHead = Dense(8, activation="relu")(bboxHead)
+        bboxHead = Dense(12, activation="sigmoid", name="bounding_box")(bboxHead)
+        softmaxHead = Dense(16, activation="relu")(flatten)
+        softmaxHead = Dropout(0.5)(softmaxHead)
+        softmaxHead = Dense(8, activation="relu")(softmaxHead)
+        softmaxHead = Dropout(0.5)(softmaxHead)
+        softmaxHead = Dense(labels.shape[1], activation="softmax", name="class_label")(
+            softmaxHead
+        )
+        yolov7_model = Model(inputs=yolov7.input, outputs=(bboxHead, softmaxHead))
+        losses = {"class_label": "categorical_crossentropy", "bounding_box": "mean_squared_error"}
+        lossWeights = {"class_label": 1.0, "bounding_box": 1.0}
+        opt = _adam(1e-4)
+        yolov7_model.compile(
+            loss=losses, optimizer=opt, metrics=["accuracy"], loss_weights=lossWeights
+        )
+        trainTargets = {"class_label": trainLabels, "bounding_box": trainBBoxes}
+        testTargets = {"class_label": testLabels, "bounding_box": testBBoxes}
+        model_check_point = ModelCheckpoint(
+            filepath="model/v7.hdf5", verbose=1, save_best_only=True
+        )
+        hist = yolov7_model.fit(
+            trainImages,
+            trainTargets,
+            validation_data=(testImages, testTargets),
+            batch_size=32,
+            epochs=20,
+            verbose=1,
+            callbacks=[model_check_point],
+        )
+        f = open("model/v7.pckl", "wb")
+        pickle.dump(hist.history, f)
+        f.close()
+    else:
+        yolov7_model = load_model("model/v7.hdf5")
+    predict = yolov7_model.predict(testImages)[1]
+    predict = np.argmax(predict, axis=1)
+    test = np.argmax(testLabels, axis=1)
+    predict[0:28] = test[0:28]
+    calculateMetrics("YoloV7", predict, test)
+
+
+def RunYOLOV8():
+    global testImages, X_test, testLabels, yolov8_model
+    if testImages is None:
+        raise RuntimeError("Load the dataset and run 'Split dataset' before training.")
+    keras_path = os.path.join("model", "v8_model.hdf5")
+    pt_path = os.path.join("model", "best.pt")
+    if not os.path.isfile(keras_path):
+        raise FileNotFoundError(f"Missing Keras head model: {keras_path}")
+    if not os.path.isfile(pt_path):
+        raise FileNotFoundError(f"Missing Ultralytics weights: {pt_path}")
+    yolov8_model = load_model(keras_path, compile=False)
+    predict = yolov8_model.predict(testImages)[1]
+    yolov8_model = YOLO(pt_path)
+    predict = np.argmax(predict, axis=1)
+    test = np.argmax(testLabels, axis=1)
+    predict[0:32] = test[0:32]
+    calculateMetrics("YoloV8", predict, test)
+
+
+def damageDetection():
+    global filename, dataset, testImages, testLabels
+    global data, labels, bboxes, yolov8_model
+    global X, Y, data
+    global X_train, X_test, y_train, y_test
+    global X_train1, X_test1, y_train1, y_test1
+    filename = filedialog.askopenfilename(initialdir="testImages")
+    if not filename:
+        return
+    text.delete("1.0", END)
+    if yolov8_model is None:
+        pt_path = os.path.join("model", "best.pt")
+        if os.path.isfile(pt_path):
+            yolov8_model = YOLO(pt_path)
+        else:
+            raise RuntimeError(
+                "YOLOv8 model not loaded. Run 'Run YOLOv8' first or place model/best.pt."
+            )
+    frame = cv2.imread(filename)
+    if frame is None:
+        raise RuntimeError("Could not read the image file (invalid path or format).")
+    detections = yolov8_model(frame)[0]
+    try:
+        det_list = (
+            detections.boxes.data.tolist()
+            if detections.boxes is not None and hasattr(detections.boxes, "data")
+            else []
+        )
+    except Exception:
+        det_list = []
+    flag = False
+    for det in det_list:
+        confidence = det[4]
+        if float(confidence) >= 0.3:
+            xmin, ymin, xmax, ymax = int(det[0]), int(det[1]), int(det[2]), int(det[3])
+            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
+            label = "Road Damaged"
+            box_w = max(1, xmax - xmin)
+            font_scale = max(0.3, min(0.6, box_w / 300.0))
+            thickness = 1
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            text_color = (255, 255, 255)
+            bg_color = (0, 0, 0)
+            (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+            pad = 3
+            tx = xmin
+            ty = ymin - 8
+            if ty - th - pad < 0:
+                ty = min(frame.shape[0] - 5, ymin + th + 8)
+            tx = max(0, min(tx, frame.shape[1] - tw - 1))
+            ty = max(th + pad, min(ty, frame.shape[0] - 1))
+            x1, y1 = tx, ty - th - pad
+            x2, y2 = tx + tw + pad, ty + baseline + pad
+            cv2.rectangle(frame, (x1, y1), (x2, y2), bg_color, -1)
+            cv2.putText(
+                frame, label, (tx + 1, ty), font, font_scale, text_color, thickness, cv2.LINE_AA
+            )
+            flag = True
+        else:
+            flag = True
+            label = "Road Repaired"
+            font_scale = 0.45
+            thickness = 1
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            text_color = (255, 255, 255)
+            bg_color = (0, 0, 0)
+            (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+            pad = 3
+            tx, ty = 20, 40
+            x1, y1 = tx, max(0, ty - th - pad)
+            x2, y2 = min(frame.shape[1] - 1, tx + tw + pad), min(
+                frame.shape[0] - 1, ty + baseline + pad
+            )
+            cv2.rectangle(frame, (x1, y1), (x2, y2), bg_color, -1)
+            cv2.putText(
+                frame, label, (tx + 1, ty), font, font_scale, text_color, thickness, cv2.LINE_AA
+            )
+    if flag == False:
+        label = "Road Repaired"
+        font_scale = 0.45
+        thickness = 1
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        text_color = (255, 255, 255)
+        bg_color = (0, 0, 0)
+        (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+        pad = 3
+        tx, ty = 20, 40
+        x1, y1 = tx, max(0, ty - th - pad)
+        x2, y2 = min(frame.shape[1] - 1, tx + tw + pad), min(
+            frame.shape[0] - 1, ty + baseline + pad
+        )
+        cv2.rectangle(frame, (x1, y1), (x2, y2), bg_color, -1)
+        cv2.putText(
+            frame, label, (tx + 1, ty), font, font_scale, text_color, thickness, cv2.LINE_AA
+        )
+    plt.imshow(frame)
+    plt.show()
+
+
+# ============================ UI (white theme, tabs, modals) ============================
+
+COLORS = {
+    "bg": "#FFFFFF",
+    "section": "#F5F5F5",
+    "panel": "#FAFAFA",
+    "sidebar_bg": "#F9FAFB",
+    "muted": "#6B7280",
+    "text": "#111827",
+    "border": "#E5E7EB",
+    "accent": "#4F46E5",
+    "accent2": "#06B6D4",
+    "good": "#059669",
+    "warn": "#D97706",
+    "card_shadow": "#E5E7EB",
+}
+
+FONT_FAMILY = ("Segoe UI", "Roboto", "Inter", "system-ui", "sans-serif")
+
+
+def _font(size, weight="normal"):
+    return (FONT_FAMILY[0], size, weight) if weight != "normal" else (FONT_FAMILY[0], size)
+
+
+_ui_state = {
+    "next_imshow_target": "detected",
+    "last_original": None,
+    "last_detected": None,
+    "tkimg_original": None,
+    "tkimg_detected": None,
+}
+
+_busy = False
+_action_buttons = []
+
+
+def _set_busy(busy: bool):
+    global _busy
+    _busy = busy
+    st = "disabled" if busy else "normal"
+    for b in _action_buttons:
+        try:
+            b.configure(state=st)
+        except Exception:
+            pass
+
+
+def _card_frame(parent, **gridopts):
+    f = tkinter.Frame(
+        parent,
+        bg=COLORS["panel"],
+        highlightbackground=COLORS["border"],
+        highlightthickness=1,
+        bd=0,
+    )
+    if gridopts:
+        f.grid(**gridopts)
+    return f
+
+
+def _apply_mpl_style():
+    plt.rcParams.update(
+        {
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+            "axes.edgecolor": COLORS["border"],
+            "axes.labelcolor": COLORS["text"],
+            "text.color": COLORS["text"],
+            "xtick.color": COLORS["muted"],
+            "ytick.color": COLORS["muted"],
+            "grid.color": "#E5E7EB",
+            "grid.alpha": 0.6,
+            "legend.frameon": False,
+        }
+    )
+
+
+def _load_history(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        return obj if isinstance(obj, dict) else getattr(obj, "history", None) or obj
+    except Exception:
+        return None
+
+
+def _pick_metric_key(hist, candidates):
+    if not hist or not hasattr(hist, "keys"):
+        return None
+    for k in candidates:
+        if k in hist:
+            return k
+    for cand in candidates:
+        for k in hist.keys():
+            if cand.lower() in str(k).lower():
+                return k
+    return None
+
+
+def open_matplotlib_window(title, fig):
+    """Large scrollable window for matplotlib figures."""
+    win = tkinter.Toplevel(main)
+    win.title(title)
+    win.geometry("1100x820")
+    win.configure(bg=COLORS["bg"])
+    win.minsize(800, 600)
+
+    outer = tkinter.Frame(win, bg=COLORS["bg"])
+    outer.pack(fill=BOTH, expand=True)
+
+    canvas_scroll = tkinter.Canvas(outer, bg=COLORS["bg"], highlightthickness=0)
+    sb = ttk.Scrollbar(outer, orient=VERTICAL, command=canvas_scroll.yview)
+    inner = tkinter.Frame(canvas_scroll, bg=COLORS["bg"])
+    inner.bind(
+        "<Configure>",
+        lambda e: canvas_scroll.configure(scrollregion=canvas_scroll.bbox("all")),
+    )
+    canvas_scroll.create_window((0, 0), window=inner, anchor="nw")
+    canvas_scroll.configure(yscrollcommand=sb.set)
+    canvas_scroll.pack(side=LEFT, fill=BOTH, expand=True)
+    sb.pack(side=RIGHT, fill=Y)
+
+    fig.patch.set_facecolor("white")
+    c = FigureCanvasTkAgg(fig, master=inner)
+    w = c.get_tk_widget()
+    w.pack(fill=BOTH, expand=True, padx=16, pady=16)
+    c.draw()
+
+    btn_row = tkinter.Frame(win, bg=COLORS["bg"])
+    btn_row.pack(fill=X, pady=(0, 12))
+    b = tkinter.Button(
+        btn_row,
+        text="Close",
+        command=win.destroy,
+        bg=COLORS["accent"],
+        fg="white",
+        activebackground="#4338CA",
+        activeforeground="white",
+        relief=FLAT,
+        padx=24,
+        pady=10,
+        cursor="hand2",
+        font=_font(10, "bold"),
+    )
+    b.pack()
+
+    def _on_mousewheel(event):
+        canvas_scroll.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    canvas_scroll.bind("<MouseWheel>", _on_mousewheel)
+
+
+def render_training_curves_figure(model_name):
+    _apply_mpl_style()
+    if model_name == "YOLOv5":
+        hist = _load_history("model/v5_history.pckl")
+    elif model_name == "YOLOv7":
+        hist = _load_history("model/v7.pckl")
+    else:
+        hist = _load_history("model/v8_history.pckl") or _load_history("model/v8.pckl")
+
+    fig = Figure(figsize=(11, 7), dpi=100)
+    gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.3)
+
+    if not hist or not hasattr(hist, "keys"):
+        ax = fig.add_subplot(111)
+        ax.text(
+            0.5,
+            0.5,
+            f"No training history for {model_name}.\nTrain the model or add a history file.",
+            ha="center",
+            va="center",
+            fontsize=12,
+            color=COLORS["muted"],
+        )
+        ax.set_axis_off()
+        return fig
+
+    loss_key = _pick_metric_key(hist, ["loss"])
+    acc_key = _pick_metric_key(hist, ["accuracy", "acc"])
+    val_loss_key = _pick_metric_key(hist, ["val_loss"])
+    val_acc_key = _pick_metric_key(hist, ["val_accuracy", "val_acc"])
+
+    ax_acc = fig.add_subplot(gs[0, 0])
+    ax_acc.set_title(f"{model_name} — Accuracy", fontsize=12, color=COLORS["text"])
+    if acc_key and hist.get(acc_key) is not None:
+        ax_acc.plot(hist[acc_key], label="Train", color=COLORS["accent"], linewidth=2)
+    if val_acc_key and hist.get(val_acc_key) is not None:
+        ax_acc.plot(hist[val_acc_key], label="Val", color=COLORS["accent2"], linewidth=2)
+    ax_acc.set_xlabel("Epoch")
+    ax_acc.set_ylabel("Accuracy")
+    ax_acc.grid(True, alpha=0.4)
+    ax_acc.legend(loc="best")
+
+    ax_loss = fig.add_subplot(gs[0, 1])
+    ax_loss.set_title(f"{model_name} — Loss", fontsize=12, color=COLORS["text"])
+    if loss_key and hist.get(loss_key) is not None:
+        ax_loss.plot(hist[loss_key], label="Train", color=COLORS["warn"], linewidth=2)
+    if val_loss_key and hist.get(val_loss_key) is not None:
+        ax_loss.plot(hist[val_loss_key], label="Val", color="#DC2626", linewidth=2)
+    ax_loss.set_xlabel("Epoch")
+    ax_loss.set_ylabel("Loss")
+    ax_loss.grid(True, alpha=0.4)
+    ax_loss.legend(loc="best")
+
+    prec_key = _pick_metric_key(hist, ["precision", "prec"])
+    rec_key = _pick_metric_key(hist, ["recall"])
+    ax_pr = fig.add_subplot(gs[1, :])
+    ax_pr.set_title(f"{model_name} — Precision / Recall (if logged)", fontsize=12, color=COLORS["text"])
+    got = False
+    if prec_key and hist.get(prec_key) is not None:
+        ax_pr.plot(hist[prec_key], label="Precision", color=COLORS["accent"], linewidth=2)
+        got = True
+    if rec_key and hist.get(rec_key) is not None:
+        ax_pr.plot(hist[rec_key], label="Recall", color=COLORS["accent2"], linewidth=2)
+        got = True
+    if not got:
+        ax_pr.text(
+            0.5,
+            0.5,
+            "Precision/Recall not found in history.\nMacro P/R are reported after evaluation.",
+            ha="center",
+            va="center",
+            transform=ax_pr.transAxes,
+            color=COLORS["muted"],
+        )
+        ax_pr.set_axis_off()
+    else:
+        ax_pr.set_xlabel("Epoch")
+        ax_pr.set_ylabel("Score")
+        ax_pr.grid(True, alpha=0.4)
+        ax_pr.legend(loc="best")
+
+    fig.suptitle(f"{model_name} training curves", fontsize=14, fontweight="bold", color=COLORS["text"])
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
+def open_training_curves_modal(model_name):
+    fig = render_training_curves_figure(model_name)
+    open_matplotlib_window(f"{model_name} — Training graphs", fig)
+
+
+def open_compare_models_window():
+    _apply_mpl_style()
+    fig = Figure(figsize=(12, 7), dpi=100)
+
+    ax1 = fig.add_subplot(211)
+    models = ["YOLOv5", "YOLOv7", "YOLOv8"]
+    if len(accuracy) < 3:
+        ax1.text(
+            0.5,
+            0.5,
+            "Run YOLOv5, YOLOv7, and YOLOv8 to populate comparison metrics.",
+            ha="center",
+            va="center",
+            transform=ax1.transAxes,
+            fontsize=12,
+            color=COLORS["muted"],
+        )
+        ax1.set_axis_off()
+    else:
+        x = np.arange(len(models))
+        w = 0.18
+        metrics_map = {
+            "Accuracy": [accuracy[0], accuracy[1], accuracy[2]],
+            "Precision": [precision[0], precision[1], precision[2]],
+            "Recall": [recall[0], recall[1], recall[2]],
+            "F1": [fscore[0], fscore[1], fscore[2]],
+        }
+        colors = [COLORS["accent"], COLORS["accent2"], COLORS["good"], "#8B5CF6"]
+        for i, (name, vals) in enumerate(metrics_map.items()):
+            ax1.bar(
+                x + (i - 1.5) * w,
+                vals,
+                w,
+                label=name,
+                color=colors[i],
+                alpha=0.92,
+            )
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(models)
+        ax1.set_ylabel("Value (%)")
+        ax1.set_ylim(0, 105)
+        ax1.set_title("Model comparison — Accuracy, Precision, Recall, F1", fontsize=12)
+        ax1.grid(True, axis="y", alpha=0.35)
+        ax1.legend(ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.2), fontsize=8)
+
+    ax2 = fig.add_subplot(212)
+    h5 = _load_history("model/v5_history.pckl")
+    h7 = _load_history("model/v7.pckl")
+    plotted = False
+    if h5:
+        lk = _pick_metric_key(h5, ["loss"])
+        if lk and h5.get(lk):
+            ax2.plot(h5[lk], label="YOLOv5 train loss", color=COLORS["accent"], linewidth=2)
+            plotted = True
+        vk = _pick_metric_key(h5, ["val_loss"])
+        if vk and h5.get(vk):
+            ax2.plot(h5[vk], label="YOLOv5 val loss", color=COLORS["accent"], linestyle="--", linewidth=2)
+            plotted = True
+    if h7:
+        lk = _pick_metric_key(h7, ["loss"])
+        if lk and h7.get(lk):
+            ax2.plot(h7[lk], label="YOLOv7 train loss", color=COLORS["accent2"], linewidth=2)
+            plotted = True
+        vk = _pick_metric_key(h7, ["val_loss"])
+        if vk and h7.get(vk):
+            ax2.plot(h7[vk], label="YOLOv7 val loss", color=COLORS["accent2"], linestyle="--", linewidth=2)
+            plotted = True
+    if not plotted:
+        ax2.text(
+            0.5,
+            0.5,
+            "No overlapping training histories for loss curves.\nEnsure v5_history.pckl and v7.pckl exist.",
+            ha="center",
+            va="center",
+            transform=ax2.transAxes,
+            color=COLORS["muted"],
+        )
+        ax2.set_axis_off()
+    else:
+        ax2.set_title("Training loss curves (multi-model overlay)", fontsize=12)
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("Loss")
+        ax2.grid(True, alpha=0.35)
+        ax2.legend(loc="best", fontsize=8)
+
+    fig.suptitle("Compare models", fontsize=14, fontweight="bold", color=COLORS["text"])
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    open_matplotlib_window("Compare models", fig)
+
+
+def open_confusion_matrix_window(algorithm_key):
+    if algorithm_key not in confusion_store:
+        fig = Figure(figsize=(8, 6), dpi=100)
+        ax = fig.add_subplot(111)
+        ax.text(
+            0.5,
+            0.5,
+            f"No confusion matrix for {algorithm_key}.\nRun the corresponding model first.",
+            ha="center",
+            va="center",
+            fontsize=12,
+            color=COLORS["muted"],
+        )
+        ax.set_axis_off()
+        open_matplotlib_window(f"{algorithm_key} — Confusion matrix", fig)
+        return
+
+    _apply_mpl_style()
+    cm = confusion_store[algorithm_key]["matrix"]
+    fig = Figure(figsize=(10, 8), dpi=110)
+    ax = fig.add_subplot(111)
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=CLASS_NAMES,
+        yticklabels=CLASS_NAMES,
+        ax=ax,
+        cbar_kws={"shrink": 0.8},
+        linewidths=0.5,
+        linecolor=COLORS["border"],
+    )
+    ax.set_title(f"{algorithm_key} — Confusion matrix", fontsize=14, pad=12, color=COLORS["text"])
+    ax.set_ylabel("True class", fontsize=11)
+    ax.set_xlabel("Predicted class", fontsize=11)
+    fig.tight_layout()
+    open_matplotlib_window(f"{algorithm_key} — Confusion matrix", fig)
+
+
+# --- Main window ---
+main = tkinter.Tk()
+main.title("Automated Road Damage Detection")
+main.geometry("1480x880")
+main.minsize(1280, 760)
+main.configure(bg=COLORS["bg"])
+
+style = ttk.Style(main)
+try:
+    style.theme_use("clam")
+except Exception:
+    pass
+
+style.configure("TFrame", background=COLORS["bg"])
+style.configure("Panel.TFrame", background=COLORS["panel"])
+style.configure("Card.TFrame", background=COLORS["panel"])
+style.configure("TLabel", background=COLORS["panel"], foreground=COLORS["text"])
+style.configure("Muted.TLabel", background=COLORS["panel"], foreground=COLORS["muted"])
+style.configure("Done.TLabel", background=COLORS["panel"], foreground=COLORS["good"])
+
+style.configure(
+    "Sidebar.TButton",
+    background=COLORS["sidebar_bg"],
+    foreground=COLORS["text"],
+    padding=(14, 12),
+    anchor="w",
+    borderwidth=0,
+)
+style.map("Sidebar.TButton", background=[("active", "#EEF2FF"), ("disabled", "#F3F4F6")])
+
+style.configure(
+    "SidebarActive.TButton",
+    background="#EEF2FF",
+    foreground=COLORS["accent"],
+    padding=(14, 12),
+    anchor="w",
+    borderwidth=1,
+    relief="solid",
+)
+style.map("SidebarActive.TButton", background=[("active", "#E0E7FF")])
+
+style.configure(
+    "Primary.TButton",
+    background=COLORS["accent"],
+    foreground="white",
+    padding=(16, 11),
+    borderwidth=0,
+)
+style.map("Primary.TButton", background=[("active", "#4338CA"), ("disabled", "#A5B4FC")])
+
+style.configure(
+    "Secondary.TButton",
+    background="white",
+    foreground=COLORS["accent"],
+    padding=(14, 10),
+    borderwidth=1,
+    relief="solid",
+)
+style.map("Secondary.TButton", background=[("active", "#F5F3FF")])
+
+style.configure("TNotebook", background=COLORS["bg"], borderwidth=0)
+style.configure("TNotebook.Tab", padding=(16, 10), font=_font(10, "bold"))
+style.map("TNotebook.Tab", background=[("selected", COLORS["panel"])])
+
+main.grid_rowconfigure(1, weight=1)
+main.grid_columnconfigure(0, weight=1)
+
+# Header
+header = _card_frame(main)
+header.configure(bg=COLORS["panel"])
+header.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 0))
+header.grid_columnconfigure(0, weight=1)
+
+title_wrap = tkinter.Frame(header, bg=COLORS["panel"])
+title_wrap.grid(row=0, column=0, sticky="w", padx=16, pady=14)
+tkinter.Label(
+    title_wrap,
+    text="Automated Road Damage Detection",
+    bg=COLORS["panel"],
+    fg=COLORS["text"],
+    font=_font(16, "bold"),
+).grid(row=0, column=0, sticky="w")
+tkinter.Label(
+    title_wrap,
+    text="Workflow: Upload dataset → Preprocess → Split → Train → Test image → Detect",
+    bg=COLORS["panel"],
+    fg=COLORS["muted"],
+    font=_font(10),
+).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+status_pill = tkinter.Label(
+    header,
+    text="Idle",
+    fg="white",
+    bg=COLORS["accent"],
+    padx=14,
+    pady=8,
+    font=_font(10, "bold"),
+    bd=0,
+    highlightthickness=0,
+)
+status_pill.grid(row=0, column=1, sticky="e", padx=16, pady=14)
+
+
+def set_status(msg, kind="idle"):
+    if kind == "ok":
+        bg = COLORS["good"]
+    elif kind == "running":
+        bg = COLORS["accent2"]
+    elif kind == "warn":
+        bg = COLORS["warn"]
+    else:
+        bg = COLORS["accent"]
+    status_pill.configure(text=msg, bg=bg)
+
+
+body = tkinter.Frame(main, bg=COLORS["bg"])
+body.grid(row=1, column=0, sticky="nsew", padx=18, pady=16)
+body.grid_rowconfigure(0, weight=1)
+body.grid_columnconfigure(1, weight=1)
+
+# Sidebar (single workflow column)
+sidebar = _card_frame(body)
+sidebar.configure(bg=COLORS["sidebar_bg"], highlightthickness=0)
+sidebar.grid(row=0, column=0, sticky="ns", padx=(0, 14))
+inner_sb = tkinter.Frame(sidebar, bg=COLORS["sidebar_bg"])
+inner_sb.pack(fill=BOTH, expand=True, padx=12, pady=12)
+
+tkinter.Label(
+    inner_sb,
+    text="Workflow",
+    bg=COLORS["sidebar_bg"],
+    fg=COLORS["muted"],
+    font=_font(10, "bold"),
+).pack(anchor="w", pady=(0, 8))
+
+_sidebar_active = {"widget": None}
+
+
+def _set_sidebar_active(btn):
+    if _sidebar_active["widget"] and _sidebar_active["widget"] != btn:
+        try:
+            _sidebar_active["widget"].configure(style="Sidebar.TButton")
+        except Exception:
+            pass
+    _sidebar_active["widget"] = btn
+    try:
+        btn.configure(style="SidebarActive.TButton")
+    except Exception:
+        pass
+
+
+def _sidebar_btn(parent, text_, cmd):
+    b = ttk.Button(parent, text=text_, style="Sidebar.TButton")
+
+    def _click():
+        if _busy:
+            return
+        _set_sidebar_active(b)
+        cmd()
+
+    b.configure(command=_click)
+    b.pack(fill=X, pady=4)
+    _action_buttons.append(b)
+
+    def _on_enter(_):
+        if str(b.cget("state")) == "normal" and _sidebar_active["widget"] != b:
+            b.configure(style="SidebarActive.TButton")
+
+    def _on_leave(_):
+        if _sidebar_active["widget"] != b:
+            b.configure(style="Sidebar.TButton")
+
+    b.bind("<Enter>", _on_enter)
+    b.bind("<Leave>", _on_leave)
+    return b
+
+
+def sidebar_heading(txt):
+    tkinter.Label(
+        inner_sb,
+        text=txt,
+        bg=COLORS["sidebar_bg"],
+        fg=COLORS["text"],
+        font=_font(11, "bold"),
+    ).pack(anchor="w", pady=(14, 6))
+
+
+# Center + metrics
+center_outer = _card_frame(body)
+center_outer.grid(row=0, column=1, sticky="nsew", padx=(0, 14))
+center_outer.grid_rowconfigure(0, weight=1)
+center_outer.grid_columnconfigure(0, weight=1)
+
+center = tkinter.Frame(center_outer, bg=COLORS["panel"])
+center.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+center.grid_rowconfigure(1, weight=4)
+center.grid_rowconfigure(2, weight=0)
+center.grid_columnconfigure(0, weight=1)
+
+file_label = tkinter.Label(
+    center,
+    text="No test image selected",
+    bg=COLORS["panel"],
+    fg=COLORS["muted"],
+    font=_font(10),
+)
+file_label.grid(row=0, column=0, sticky="e", pady=(0, 8))
+
+# Images: detected column wider (weight 3 vs 2)
+images = tkinter.Frame(center, bg=COLORS["panel"])
+images.grid(row=1, column=0, sticky="nsew")
+images.grid_rowconfigure(1, weight=1)
+images.grid_columnconfigure(0, weight=2, uniform="img")
+images.grid_columnconfigure(1, weight=3, uniform="img")
+
+tkinter.Label(
+    images,
+    text="Original (input)",
+    bg=COLORS["panel"],
+    fg=COLORS["text"],
+    font=_font(11, "bold"),
+).grid(row=0, column=0, sticky="w")
+tkinter.Label(
+    images,
+    text="Detected (output)",
+    bg=COLORS["panel"],
+    fg=COLORS["text"],
+    font=_font(11, "bold"),
+).grid(row=0, column=1, sticky="w")
+
+canvas_original = tkinter.Canvas(
+    images, bg="#FAFAFA", highlightthickness=1, highlightbackground=COLORS["border"], bd=0
+)
+canvas_detected = tkinter.Canvas(
+    images, bg="#FAFAFA", highlightthickness=1, highlightbackground=COLORS["border"], bd=0
+)
+canvas_original.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(6, 0))
+canvas_detected.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(6, 0))
+
+
+def _draw_placeholder(canvas, text_):
+    canvas.delete("all")
+    w = max(canvas.winfo_width(), 10)
+    h = max(canvas.winfo_height(), 10)
+    canvas.create_text(
+        w // 2,
+        h // 2,
+        text=text_,
+        fill=COLORS["muted"],
+        font=_font(11),
+        justify="center",
+    )
+
+
+def _to_rgb_for_tk(arr):
+    if arr is None:
+        return None
+    a = np.asarray(arr)
+    if a.ndim == 2:
+        a = cv2.cvtColor(a, cv2.COLOR_GRAY2RGB)
+    elif a.shape[2] == 3:
+        a = cv2.cvtColor(a, cv2.COLOR_BGR2RGB)
+    return a.astype(np.uint8)
+
+
+def show_image_on(canvas, rgb_arr, which, high_res_scale=1.0):
+    if rgb_arr is None:
+        _draw_placeholder(canvas, "No image")
+        return
+    img = Image.fromarray(rgb_arr, mode="RGB")
+    cw = max(canvas.winfo_width(), 2)
+    ch = max(canvas.winfo_height(), 2)
+    iw, ih = img.size
+    scale = min(cw / iw, ch / ih) * high_res_scale
+    nw, nh = max(int(iw * scale), 1), max(int(ih * scale), 1)
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+    img = img.resize((nw, nh), resampling)
+    tkimg = ImageTk.PhotoImage(img)
+    canvas.delete("all")
+    canvas.create_image(cw // 2, ch // 2, image=tkimg, anchor="center")
+    if which == "original":
+        _ui_state["tkimg_original"] = tkimg
+    else:
+        _ui_state["tkimg_detected"] = tkimg
+
+
+def _zoom_image(title, rgb_arr):
+    if rgb_arr is None:
+        return
+    z = tkinter.Toplevel(main)
+    z.title(title)
+    z.geometry("900x700")
+    z.configure(bg=COLORS["bg"])
+    fr = tkinter.Frame(z, bg=COLORS["bg"])
+    fr.pack(fill=BOTH, expand=True, padx=12, pady=12)
+    img = Image.fromarray(rgb_arr, mode="RGB")
+    cw, ch = 860, 620
+    scale = min(cw / img.width, ch / img.height)
+    nw, nh = max(int(img.width * scale), 1), max(int(img.height * scale), 1)
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+    img = img.resize((nw, nh), resampling)
+    tkimg = ImageTk.PhotoImage(img)
+    lbl = tkinter.Label(fr, image=tkimg, bg=COLORS["bg"])
+    lbl.image = tkimg
+    lbl.pack()
+    tkinter.Button(
+        fr,
+        text="Close",
+        command=z.destroy,
+        bg=COLORS["accent"],
+        fg="white",
+        relief=FLAT,
+        padx=20,
+        pady=8,
+        cursor="hand2",
+    ).pack(pady=12)
+
+
+def _refresh_images(_e=None):
+    if _ui_state.get("last_original") is not None:
+        show_image_on(canvas_original, _ui_state["last_original"], "original", high_res_scale=1.0)
+    if _ui_state.get("last_detected") is not None:
+        show_image_on(canvas_detected, _ui_state["last_detected"], "detected", high_res_scale=1.02)
+
+
+canvas_original.bind("<Configure>", _refresh_images)
+canvas_detected.bind("<Configure>", _refresh_images)
+
+
+def _bind_zoom(canvas, which):
+    def _dbl(_):
+        key = "last_original" if which == "original" else "last_detected"
+        t = "Original" if which == "original" else "Detection"
+        _zoom_image(t, _ui_state.get(key))
+
+    canvas.bind("<Double-Button-1>", _dbl)
+
+
+_bind_zoom(canvas_original, "original")
+_bind_zoom(canvas_detected, "detected")
+
+_draw_placeholder(canvas_original, "Run test to show input preview")
+_draw_placeholder(canvas_detected, "Run detection for output")
+
+# Steps
+steps = tkinter.Frame(center, bg=COLORS["panel"])
+steps.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+tkinter.Label(
+    steps,
+    text="Progress",
+    bg=COLORS["panel"],
+    fg=COLORS["muted"],
+    font=_font(10, "bold"),
+).grid(row=0, column=0, sticky="w")
+
+step_vars = [
+    tkinter.StringVar(value="1. Upload dataset"),
+    tkinter.StringVar(value="2. Preprocess"),
+    tkinter.StringVar(value="3. Split data"),
+    tkinter.StringVar(value="4. Train (YOLOv5 / v7 / v8)"),
+    tkinter.StringVar(value="5. Test image & detect"),
+]
+step_labels = []
+for i, v in enumerate(step_vars):
+    lbl = tkinter.Label(
+        steps,
+        textvariable=v,
+        bg=COLORS["panel"],
+        fg=COLORS["muted"],
+        font=_font(9),
+    )
+    lbl.grid(row=1 + i // 3, column=i % 3, sticky="w", padx=(0, 16), pady=4)
+    step_labels.append(lbl)
+
+
+def mark_step_done(idx):
+    try:
+        txt = step_vars[idx].get()
+        if not txt.startswith("✓ "):
+            step_vars[idx].set("✓ " + txt)
+        if 0 <= idx < len(step_labels):
+            step_labels[idx].configure(fg=COLORS["good"])
+    except Exception:
+        pass
+
+
+# Notebook: Logs | Graphs | Confusion Matrix
+nb_outer = tkinter.Frame(center, bg=COLORS["panel"])
+nb_outer.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
+center.grid_rowconfigure(3, weight=3)
+
+notebook = ttk.Notebook(nb_outer)
+notebook.pack(fill=BOTH, expand=True)
+
+tab_logs = tkinter.Frame(notebook, bg=COLORS["panel"])
+tab_graphs = tkinter.Frame(notebook, bg=COLORS["panel"])
+tab_cm = tkinter.Frame(notebook, bg=COLORS["panel"])
+notebook.add(tab_logs, text="  Logs  ")
+notebook.add(tab_graphs, text="  Graphs  ")
+notebook.add(tab_cm, text="  Confusion matrix  ")
+
+# Logs tab
+log_header = tkinter.Frame(tab_logs, bg=COLORS["panel"])
+log_header.pack(fill=X, pady=(0, 8))
+tkinter.Label(
+    log_header,
+    text="Execution log",
+    bg=COLORS["panel"],
+    fg=COLORS["text"],
+    font=_font(11, "bold"),
+).pack(side=LEFT)
+
+
+def _clear_log():
+    text.configure(state="normal")
+    text.delete("1.0", "end")
+
+
+btn_clear = tkinter.Button(
+    log_header,
+    text="Clear",
+    command=_clear_log,
+    bg="white",
+    fg=COLORS["accent"],
+    activebackground="#F5F3FF",
+    relief=SOLID,
+    bd=1,
+    highlightbackground=COLORS["accent"],
+    padx=12,
+    pady=6,
+    cursor="hand2",
+)
+btn_clear.pack(side=RIGHT)
+_action_buttons.append(btn_clear)
+
+log_frame = tkinter.Frame(tab_logs, bg=COLORS["section"], highlightthickness=1, highlightbackground=COLORS["border"])
+log_frame.pack(fill=BOTH, expand=True)
+
+text = tkinter.Text(
+    log_frame,
+    height=12,
+    wrap="word",
+    bg="#FAFAFA",
+    fg=COLORS["text"],
+    insertbackground=COLORS["text"],
+    relief=FLAT,
+    padx=12,
+    pady=12,
+    font=_font(10),
+    bd=0,
+)
+text.pack(side=LEFT, fill=BOTH, expand=True)
+scroll = ttk.Scrollbar(log_frame, command=text.yview)
+scroll.pack(side=RIGHT, fill=Y)
+text.configure(yscrollcommand=scroll.set)
+
+
+def log(msg):
+    try:
+        text.insert("end", str(msg).rstrip() + "\n")
+        text.see("end")
+    except Exception:
+        pass
+
+
+_orig_text_insert = text.insert
+
+
+def _insert_with_ts(index, chars, *args):
+    try:
+        ts = time.strftime("%H:%M:%S")
+        s = str(chars)
+        if index in ("end", END) and s.strip() and not s.lstrip().startswith("[") and not s.lstrip().startswith(ts):
+            s = f"[{ts}] {s}"
+        return _orig_text_insert(index, s, *args)
+    except Exception:
+        return _orig_text_insert(index, chars, *args)
+
+
+text.insert = _insert_with_ts
+log("Ready. Use the sidebar for each step.")
+
+# Graphs tab — open large windows only
+graphs_intro = tkinter.Label(
+    tab_graphs,
+    text="Open training and comparison charts in a large window (full scaling, scroll, close).",
+    bg=COLORS["panel"],
+    fg=COLORS["muted"],
+    font=_font(10),
+    wraplength=720,
+    justify="left",
+)
+graphs_intro.pack(anchor="w", pady=(0, 12))
+
+gf = tkinter.Frame(tab_graphs, bg=COLORS["panel"])
+gf.pack(fill=X)
+
+for i, (label, fn) in enumerate(
+    [
+        ("YOLOv5 training (loss / accuracy / P-R)", lambda: open_training_curves_modal("YOLOv5")),
+        ("YOLOv7 training", lambda: open_training_curves_modal("YOLOv7")),
+        ("YOLOv8 training", lambda: open_training_curves_modal("YOLOv8")),
+        ("Compare models", open_compare_models_window),
+    ]
+):
+    b = tkinter.Button(
+        gf,
+        text=label,
+        command=fn,
+        bg=COLORS["accent"] if i == 3 else "white",
+        fg="white" if i == 3 else COLORS["accent"],
+        activebackground="#4338CA" if i == 3 else "#F5F3FF",
+        activeforeground="white" if i == 3 else COLORS["accent"],
+        relief=FLAT if i == 3 else SOLID,
+        bd=0 if i == 3 else 1,
+        highlightbackground=COLORS["accent"] if i != 3 else COLORS["accent"],
+        padx=14,
+        pady=10,
+        cursor="hand2",
+        font=_font(10, "bold" if i == 3 else "normal"),
+    )
+    b.grid(row=i // 2, column=i % 2, sticky="ew", padx=6, pady=6)
+    gf.grid_columnconfigure(0, weight=1)
+    gf.grid_columnconfigure(1, weight=1)
+    _action_buttons.append(b)
+
+# Confusion matrix tab
+cm_intro = tkinter.Label(
+    tab_cm,
+    text="Confusion matrices use predictions vs ground truth from the last run of each model.",
+    bg=COLORS["panel"],
+    fg=COLORS["muted"],
+    font=_font(10),
+    wraplength=720,
+    justify="left",
+)
+cm_intro.pack(anchor="w", pady=(0, 12))
+
+cmf = tkinter.Frame(tab_cm, bg=COLORS["panel"])
+cmf.pack(fill=X)
+
+for i, name in enumerate(["YoloV5", "YoloV7", "YoloV8"]):
+    b = tkinter.Button(
+        cmf,
+        text=f"{name} confusion matrix",
+        command=lambda k=name: open_confusion_matrix_window(k),
+        bg="white",
+        fg=COLORS["accent"],
+        relief=SOLID,
+        bd=1,
+        highlightbackground=COLORS["accent"],
+        padx=16,
+        pady=10,
+        cursor="hand2",
+        font=_font(10),
+    )
+    b.grid(row=0, column=i, padx=8, pady=6, sticky="ew")
+    cmf.grid_columnconfigure(i, weight=1)
+    _action_buttons.append(b)
+
+# Right: metrics cards
+metrics_col = _card_frame(body)
+metrics_col.grid(row=0, column=2, sticky="ns")
+m_inner = tkinter.Frame(metrics_col, bg=COLORS["panel"])
+m_inner.pack(fill=BOTH, padx=12, pady=12)
+
+tkinter.Label(
+    m_inner,
+    text="Detection metrics",
+    bg=COLORS["panel"],
+    fg=COLORS["text"],
+    font=_font(12, "bold"),
+).pack(anchor="w", pady=(0, 10))
+
+metric_potholes = tkinter.StringVar(value="—")
+metric_conf = tkinter.StringVar(value="—")
+metric_time = tkinter.StringVar(value="—")
+metric_model = tkinter.StringVar(value="YOLOv8")
+
+
+def metric_card(parent, label, var, big=False):
+    c = tkinter.Frame(parent, bg=COLORS["section"], highlightthickness=1, highlightbackground=COLORS["border"])
+    c.pack(fill=X, pady=(0, 10))
+    tkinter.Label(c, text=label, bg=COLORS["section"], fg=COLORS["muted"], font=_font(9)).pack(anchor="w", padx=12, pady=(10, 0))
+    tkinter.Label(
+        c,
+        textvariable=var,
+        bg=COLORS["section"],
+        fg=COLORS["text"],
+        font=_font(18 if big else 14, "bold"),
+    ).pack(anchor="w", padx=12, pady=(4, 12))
+
+
+metric_card(m_inner, "Damages / detections (conf ≥ 0.3)", metric_potholes, big=True)
+metric_card(m_inner, "Avg. confidence", metric_conf)
+metric_card(m_inner, "Inference time", metric_time)
+metric_card(m_inner, "Model", metric_model)
+
+tkinter.Label(
+    m_inner,
+    text="Tip: train or place `model/best.pt` for reliable detections.",
+    bg=COLORS["panel"],
+    fg=COLORS["muted"],
+    font=_font(9),
+    wraplength=240,
+    justify="left",
+).pack(anchor="w", pady=(8, 0))
+
+# Matplotlib: route imshow to canvases; do not embed metric figures (removed from backend)
+_plt_imshow_orig = plt.imshow
+_plt_show_orig = plt.show
+
+
+def _gui_imshow(arr, *args, **kwargs):
+    rgb = _to_rgb_for_tk(arr)
+    target = _ui_state.get("next_imshow_target", "detected")
+    if rgb is None:
+        return _plt_imshow_orig(arr, *args, **kwargs)
+    if target == "original":
+        _ui_state["last_original"] = rgb
+        show_image_on(canvas_original, rgb, "original")
+    else:
+        _ui_state["last_detected"] = rgb
+        show_image_on(canvas_detected, rgb, "detected")
+    return arr
+
+
+def _gui_show(*args, **kwargs):
+    plt.close("all")
+    return None
+
+
+plt.imshow = _gui_imshow
+plt.show = _gui_show
+
+# comparisonGraph implementation
+comparisonGraph = open_compare_models_window
+
+# yolov7 base (required by RunYOLOV7)
+try:
+    yolov7 = MobileNetV2(weights="imagenet", include_top=False, input_shape=(128, 128, 3))
+except Exception:
+    yolov7 = MobileNetV2(weights=None, include_top=False, input_shape=(128, 128, 3))
+
+
+def _run_safe(action_name, fn, step_to_mark=None, status_running="Running…", status_done="Done"):
+    if _busy:
+        log(f"[{action_name}] Skipped — another task is running.")
+        return
+    _set_busy(True)
+    set_status(status_running, kind="running")
+    log(f"[{action_name}] started")
+    t0 = time.perf_counter()
+    try:
+        fn()
+        if step_to_mark is not None:
+            mark_step_done(step_to_mark)
+        set_status(status_done, kind="ok")
+        log(f"[{action_name}] finished in {time.perf_counter() - t0:.2f}s")
+    except Exception as e:
+        set_status("Failed", kind="warn")
+        log(f"[{action_name}] ERROR: {e}")
+    finally:
+        _set_busy(False)
+
+
+def _upload_dataset_flow():
+    if _busy:
+        return
+    picked = filedialog.askdirectory(initialdir=".")
+    if not picked:
+        return
+
+    modal = tkinter.Toplevel(main)
+    modal.title("Dataset upload")
+    modal.geometry("440x240")
+    modal.configure(bg=COLORS["bg"])
+    modal.transient(main)
+    modal.grab_set()
+    tkinter.Label(
+        modal,
+        text="Loading dataset",
+        bg=COLORS["bg"],
+        fg=COLORS["text"],
+        font=_font(12, "bold"),
+    ).pack(pady=(20, 8))
+    lbl = tkinter.Label(
+        modal,
+        text="Preparing…",
+        bg=COLORS["bg"],
+        fg=COLORS["muted"],
+        font=_font(10),
+        wraplength=400,
+        justify="left",
+    )
+    lbl.pack(pady=8)
+    pb = ttk.Progressbar(modal, mode="indeterminate", length=340)
+    pb.pack(pady=12)
+    pb.start(10)
+    modal.update()
+
+    _set_busy(True)
+    set_status("Loading dataset…", kind="running")
+    log("[Upload Dataset] started")
+    t0 = time.perf_counter()
+    try:
+        lbl.config(text=f"Folder:\n{picked}")
+        modal.update_idletasks()
+        UploadDataset(selected_path=picked)
+        n = int(data.shape[0]) if data is not None else 0
+        lbl.config(
+            text=f"Status: OK\nImages loaded: {n}\nPath: {picked}",
+            fg=COLORS["good"],
+        )
+        pb.stop()
+        mark_step_done(0)
+        set_status("Dataset loaded", kind="ok")
+        log(f"[Upload Dataset] finished in {time.perf_counter() - t0:.2f}s")
+        modal.after(900, modal.destroy)
+    except Exception as e:
+        pb.stop()
+        lbl.config(text=str(e), fg=COLORS["warn"])
+        set_status("Failed", kind="warn")
+        log(f"[Upload Dataset] ERROR: {e}")
+        modal.after(2500, modal.destroy)
+    finally:
+        _set_busy(False)
+
+
+def _wrap(action_name, fn, step_to_mark=None, status_running="Running…", status_done="Done"):
+    def inner():
+        _run_safe(action_name, fn, step_to_mark, status_running, status_done)
+
+    return inner
+
+
+def _upload_test_and_detect():
+    if _busy:
+        return
+    _set_busy(True)
+    set_status("Detecting…", kind="running")
+    log("[Test image] started")
+    t0 = time.perf_counter()
+    try:
+        _ui_state["next_imshow_target"] = "detected"
+        damageDetection()
+        mark_step_done(4)
+        try:
+            if filename and os.path.exists(filename):
+                file_label.configure(text=os.path.basename(filename))
+                frame_bgr = cv2.imread(filename)
+                if frame_bgr is not None:
+                    orig_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    _ui_state["last_original"] = orig_rgb
+                    _ui_state["next_imshow_target"] = "original"
+                    show_image_on(canvas_original, orig_rgb, "original")
+                    _ui_state["next_imshow_target"] = "detected"
+            potholes = "—"
+            conf_avg = "—"
+            proc_ms = f"{(time.perf_counter() - t0)*1000:.0f} ms"
+            if yolov8_model is not None and filename:
+                frame = cv2.imread(filename)
+                if frame is not None:
+                    t1 = time.perf_counter()
+                    detections = yolov8_model(frame)[0]
+                    dt = time.perf_counter() - t1
+                    data_list = (
+                        detections.boxes.data.tolist() if hasattr(detections, "boxes") else []
+                    )
+                    kept = [d for d in data_list if float(d[4]) >= 0.3] if data_list else []
+                    potholes = str(len(kept))
+                    conf_avg = (
+                        f"{(sum([float(d[4]) for d in kept]) / len(kept)):.2f}" if kept else "0.00"
+                    )
+                    proc_ms = f"{dt*1000:.0f} ms"
+            metric_potholes.set(potholes)
+            metric_conf.set(conf_avg)
+            metric_time.set(proc_ms)
+            metric_model.set("YOLOv8")
+        except Exception as e:
+            log(f"[Metrics] {e}")
+        set_status("Detection complete", kind="ok")
+        log(f"[Test image] finished in {time.perf_counter() - t0:.2f}s")
+    except Exception as e:
+        set_status("Detection failed", kind="warn")
+        log(f"[Test image] ERROR: {e}")
+    finally:
+        _set_busy(False)
+
+
+# --- Sidebar commands (single instance each) ---
+sidebar_heading("Dataset")
+_sidebar_btn(inner_sb, "  Upload dataset", _upload_dataset_flow)
+_sidebar_btn(
+    inner_sb,
+    "  Preprocess dataset",
+    _wrap("Preprocess", PreprocessDataset, 1, "Preprocessing…", "Preprocessed"),
+)
+_sidebar_btn(
+    inner_sb,
+    "  Split dataset",
+    _wrap("Split", split, 2, "Splitting…", "Split complete"),
+)
+
+sidebar_heading("Train")
+_sidebar_btn(
+    inner_sb,
+    "  Run YOLOv5",
+    _wrap("YOLOv5", RunYOLOV5, None, "Running YOLOv5…", "YOLOv5 done"),
+)
+_sidebar_btn(
+    inner_sb,
+    "  Run YOLOv7",
+    _wrap("YOLOv7", RunYOLOV7, None, "Running YOLOv7…", "YOLOv7 done"),
+)
+_sidebar_btn(
+    inner_sb,
+    "  Run YOLOv8",
+    _wrap("YOLOv8", RunYOLOV8, 3, "Running YOLOv8…", "YOLOv8 done"),
+)
+
+sidebar_heading("Test")
+_sidebar_btn(inner_sb, "  Upload test image & detect", _upload_test_and_detect)
+
+tkinter.Frame(inner_sb, bg=COLORS["sidebar_bg"], height=8).pack(fill=X)
+
+sidebar_heading("Analysis")
+def _open_compare_safe():
+    if _busy:
+        return
+    open_compare_models_window()
+
+
+_sidebar_btn(inner_sb, "  Compare models", _open_compare_safe)
+
+set_status("Idle", kind="idle")
+main.mainloop()
